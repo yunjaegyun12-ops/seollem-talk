@@ -290,17 +290,58 @@ async function generateImage(prompt, { aspect = '3:4', signal } = {}) {
   const body = { model: ep.model, prompt, n: 1 };
   if (ep.kind === 'xai') { body.response_format = 'b64_json'; body.aspect_ratio = aspect; }
   else if (ep.kind === 'openai') { body.size = aspect === '1:1' ? '1024x1024' : '1024x1536'; if (/^gpt-image/.test(ep.model)) body.quality = 'medium'; else body.response_format = 'b64_json'; }
+  else if (ep.kind === 'openrouter') { body.aspect_ratio = aspect; }
   else body.response_format = 'b64_json';
-  const res = await fetch(ep.base + '/images/generations', { method: 'POST', headers: headers(ep.key, ep.base), body: JSON.stringify(body), signal });
+  const path = ep.kind === 'openrouter' ? '/images' : '/images/generations';
+  const res = await fetch(ep.base + path, { method: 'POST', headers: headers(ep.key, ep.base), body: JSON.stringify(body), signal });
   if (!res.ok) throw await apiError(res);
-  const j = await res.json(); const d = j.data?.[0];
+  return parseImageResponse(await res.json());
+}
+async function parseImageResponse(j) {
+  const d = j.data?.[0];
   if (!d) throw new Error('이미지가 생성되지 않았어요 (검열되었거나 응답이 비었어요)');
-  if (d.b64_json) return `data:${d.mime_type || 'image/png'};base64,${d.b64_json}`;
+  if (d.b64_json) return `data:${d.mime_type || d.media_type || 'image/png'};base64,${d.b64_json}`;
   if (d.url) {
     try { const r = await fetch(d.url); const blob = await r.blob(); return await fileToDataURL(blob); }
     catch { return d.url; } // CORS 차단 시 임시 URL 그대로 (나중에 만료될 수 있음)
   }
   throw new Error('알 수 없는 이미지 응답 형식이에요');
+}
+// 참고 이미지(프로필 사진) 지원 여부: 연결별 설정 'auto' | 'on' | 'off'
+function refSupport(ep) {
+  if (!ep) return false;
+  const m = ep.p.refMode || 'auto';
+  if (m === 'off') return false;
+  if (m === 'on') return true;
+  if (ep.kind === 'xai') return true;
+  if (ep.kind === 'openai') return /^gpt-image|^chatgpt-image/.test(ep.model);
+  if (ep.kind === 'openrouter') return true;
+  return false; // gemini OpenAI 호환 엔드포인트, 직접 입력은 기본적으로 미지원
+}
+const dataUrlToBlob = async u => (await fetch(u)).blob();
+async function generateImageWithRef(prompt, refDataUrl, { aspect = '3:4', signal } = {}) {
+  const ep = resolveImage();
+  if (!ep || !ep.key || !ep.model) throw new Error('이미지 연결 설정을 확인해 주세요');
+  let res;
+  if (ep.kind === 'openai') {
+    // OpenAI gpt-image: multipart /images/edits, image[] 파일
+    const fd = new FormData();
+    fd.append('model', ep.model); fd.append('prompt', prompt); fd.append('n', '1');
+    fd.append('size', aspect === '1:1' ? '1024x1024' : '1024x1536'); fd.append('quality', 'medium');
+    if (/^gpt-image-1/.test(ep.model)) fd.append('input_fidelity', 'high');
+    fd.append('image[]', await dataUrlToBlob(refDataUrl), 'reference.jpg');
+    res = await fetch(ep.base + '/images/edits', { method: 'POST', headers: { Authorization: 'Bearer ' + ep.key }, body: fd, signal });
+  } else if (ep.kind === 'openrouter') {
+    // OpenRouter Image API: /images + input_references
+    const body = { model: ep.model, prompt, n: 1, aspect_ratio: aspect, input_references: [{ type: 'image_url', image_url: { url: refDataUrl } }] };
+    res = await fetch(ep.base + '/images', { method: 'POST', headers: headers(ep.key, ep.base), body: JSON.stringify(body), signal });
+  } else {
+    // xAI (및 같은 형식의 직접 입력): JSON /images/edits, image = data URI
+    const body = { model: ep.model, prompt, n: 1, response_format: 'b64_json', image: { url: refDataUrl, type: 'image_url' } };
+    res = await fetch(ep.base + '/images/edits', { method: 'POST', headers: headers(ep.key, ep.base), body: JSON.stringify(body), signal });
+  }
+  if (!res.ok) throw await apiError(res);
+  return parseImageResponse(await res.json());
 }
 const STYLE_EN = {
   '실사': 'photorealistic candid smartphone photo, natural lighting, realistic skin texture',
@@ -487,6 +528,7 @@ function renderEditor(id) {
         <div class="muted" style="text-align:center">사진 생성은 아래 ‘외모’와 ‘사진 스타일’을 바탕으로 만들어요</div>
       </div></div>
       <div class="section"><h3>기본 정보</h3>${field(F.name)}<div class="row">${field(F.gender)}${field(F.age)}</div>${field(F.relationLabel)}
+        <div class="field toggle"><label style="margin:0">대화 중 사진은 프로필 사진 기준으로 생성<div class="hint" style="font-weight:400">얼굴·머리 모양을 프로필 사진과 똑같이 유지해요 (지원하는 이미지 서비스만)</div></label><input type="checkbox" id="f_refPhoto" ${c.refPhoto !== false ? 'checked' : ''} style="width:22px;height:22px;flex:none;accent-color:#ec4899"></div>
         <div class="field"><label>사진 스타일</label><select id="f_imageStyle">${Object.keys(STYLE_EN).map(o => `<option ${c.imageStyle === o ? 'selected' : ''}>${o}</option>`).join('')}</select></div>
         ${field(F.appearance)}</div>
       <div class="section"><h3>성격 · 말투</h3>${field(F.personality)}${field(F.speech)}
@@ -514,7 +556,7 @@ function renderEditor(id) {
     if (!e.target.classList.contains('chip')) return;
     const ta = $('#f_speech'); ta.value = ta.value.trim() ? ta.value.trim() + ', ' + e.target.textContent : e.target.textContent;
   };
-  const collect = () => { const o = { ...c }; for (const [k] of FIELDS) o[k] = $('#f_' + k).value.trim(); o.imageStyle = $('#f_imageStyle').value; o.avatar = avatar; o.chatProviderId = $('#f_chatProviderId').value; o.chatModel = o.chatProviderId ? $('#f_chatModel').value.trim() : ''; return o; };
+  const collect = () => { const o = { ...c }; for (const [k] of FIELDS) o[k] = $('#f_' + k).value.trim(); o.imageStyle = $('#f_imageStyle').value; o.avatar = avatar; o.refPhoto = $('#f_refPhoto').checked; o.chatProviderId = $('#f_chatProviderId').value; o.chatModel = o.chatProviderId ? $('#f_chatModel').value.trim() : ''; return o; };
   $('#avGen').onclick = async () => {
     const o = collect();
     if (!o.appearance) { toast('먼저 ‘외모’를 적어 주세요'); $('#f_appearance').focus(); return; }
@@ -614,7 +656,7 @@ async function renderMessages(forceBottom) {
     const showTime = !(next && next.role === m.role && fmtTime(next.ts) === fmtTime(m.ts));
     const me = m.role === 'user';
     let parts;
-    if (m.type === 'image') parts = [`<div class="bubble photo"><img src="${esc(m.image)}" alt="사진" data-view="1" loading="lazy"></div>`].concat(m.caption ? [`<div class="bubble">${richText(m.caption)}</div>`] : []);
+    if (m.type === 'image') parts = [`<div class="bubble photo"><img src="${esc(m.image)}" alt="사진" data-view="1" loading="lazy">${m.note ? `<div class="pnote">ⓘ ${esc(m.note)}</div>` : ''}</div>`].concat(m.caption ? [`<div class="bubble">${richText(m.caption)}</div>`] : []);
     else if (m.error) parts = [`<div class="bubble err">⚠️ ${esc(m.content)}</div>`];
     else parts = (me ? [m.content] : splitBubbles(m.content)).map(p => `<div class="bubble">${me ? esc(p) : richText(p)}</div>`);
     if (!parts.length) parts = ['<div class="bubble">…</div>'];
@@ -772,9 +814,20 @@ async function requestPhoto(id, request, alreadyPosted = false) {
     const prompt = `${STYLE_EN[c.imageStyle] || STYLE_EN['실사']}. ${scene} ${appearanceBlock(c)} Single adult person (19+), ${S.settings.adultMode ? 'no nudity' : 'fully clothed'}, non-explicit, tasteful, no text or watermark.`;
     if (chatState && chatState.id === id) { chatState.typing = { label: '사진 찍는 중… 📸' }; renderMessages(); }
     // 2) 이미지 생성 → 압축 저장
-    const raw = await generateImage(prompt, { aspect: '3:4', signal: controller.signal });
+    let raw = null, note = '', usedRef = false;
+    const wantRef = !!c.avatar && c.refPhoto !== false;
+    if (wantRef) {
+      const iep = resolveImage();
+      if (refSupport(iep)) {
+        const safety = `Adult (19+), ${S.settings.adultMode ? 'no nudity' : 'fully clothed'}, non-explicit, tasteful, no text or watermark.`;
+        const refPrompt = `The reference image shows ${c.name}. Create a NEW photo of the exact same person: keep the face, facial features, hairstyle, hair color and overall look identical to the reference image. Do not copy the reference composition or background. ${STYLE_EN[c.imageStyle] || STYLE_EN['실사']}. New scene: ${scene} ${appearanceBlock(c)} Single person. ${safety}`;
+        try { raw = await generateImageWithRef(refPrompt, c.avatar, { aspect: '3:4', signal: controller.signal }); usedRef = true; }
+        catch (e) { if (e.name === 'AbortError') throw e; console.warn('ref image failed', e); note = '프로필 사진 기준 생성에 실패해서 외모 설명으로 만들었어요'; }
+      } else note = '이 연결은 참고 이미지를 지원하지 않아 외모 설명으로 만들었어요';
+    }
+    if (!raw) raw = await generateImage(prompt, { aspect: '3:4', signal: controller.signal });
     let image = raw; try { image = await compressImage(raw, { max: 768, quality: 0.82 }); } catch {}
-    chat.messages.push({ id: uid(), role: 'assistant', type: 'image', image, caption: caption || '', prompt, request: request || '', ts: Date.now() });
+    chat.messages.push({ id: uid(), role: 'assistant', type: 'image', image, caption: caption || '', prompt, request: request || '', usedRef, note, ts: Date.now() });
   } catch (e) {
     if (e.name !== 'AbortError') chat.messages.push({ id: uid(), role: 'assistant', error: true, content: '사진을 만들지 못했어요: ' + friendlyError(e), ts: Date.now() });
   } finally {
@@ -1075,6 +1128,8 @@ function providerSheet(pid) {
         <div class="field"><label>추론 강도</label><select id="pv_reasoningEffort">${['', 'low', 'medium', 'high'].map(v => `<option value="${v}" ${(x.reasoningEffort || '') === v ? 'selected' : ''}>${v || '보내지 않음'}</option>`).join('')}</select></div>
       </div>
       <div class="hint muted" style="margin:-4px 0 12px">추론 강도 low는 답장을 빠르고 저렴하게 해 줘요 (지원하는 모델만).</div>
+      <div class="field"><label>참고 이미지 지원 (프로필 사진 기준 사진 생성)</label><select id="pv_refMode">${[['auto', '자동 (xAI·OpenAI gpt-image·OpenRouter 지원)'], ['on', '지원함'], ['off', '사용 안 함']].map(([v, l]) => `<option value="${v}" ${(x.refMode || 'auto') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <div class="hint">지원하지 않거나 실패하면 외모 설명만으로 만들어요. Gemini 호환 주소는 미지원이에요.</div></div>
       <div class="row">${pid ? '<button class="btn danger" id="pvDel" type="button">삭제</button>' : ''}<button class="btn primary" id="pvSave" type="button">저장</button></div>
     </div>`, el => {
     const hint = () => { $('#pvHint', el).textContent = hints[$('#pv_preset', el).value] || ''; };
@@ -1094,7 +1149,7 @@ function providerSheet(pid) {
     };
     $('#pvSave', el).onclick = () => {
       const o = { ...x };
-      for (const k of ['preset', 'name', 'baseUrl', 'apiKey', 'model', 'imageModel', 'reasoningEffort']) o[k] = $('#pv_' + k, el).value.trim();
+      for (const k of ['preset', 'name', 'baseUrl', 'apiKey', 'model', 'imageModel', 'reasoningEffort', 'refMode']) o[k] = $('#pv_' + k, el).value.trim();
       if (!o.baseUrl) { toast('API 주소를 입력해 주세요'); return; }
       if (!o.name) o.name = PRESETS[o.preset].label;
       const st = S.settings;
