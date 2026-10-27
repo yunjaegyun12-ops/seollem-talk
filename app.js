@@ -73,7 +73,7 @@ const PRESETS = {
 };
 const DEFAULT_SETTINGS = {
   providers: [], chatProviderId: '', chatModel: '', imgProviderId: '', imgModel: '',
-  temperature: '0.9', maxTokens: '600', maxMessages: '60', contextByModel: {}, imgEnabled: true,
+  temperature: '0.9', maxTokens: '600', maxMessages: '60', contextByModel: {}, imgEnabled: true, adultMode: false,
 };
 const DEFAULT_CONTEXT = 14000;
 const DEFAULT_PROFILE = { name: '재균', callName: '자기야', about: '' };
@@ -150,7 +150,12 @@ function buildSystemPrompt(c, chat) {
   L.push('- 자연스러운 한국어 구어체 메신저 말투로 쓴다. 번역투, 딱딱한 문어체, 과한 설명을 피한다. 지정된 말투(반말/존댓말 등)를 반드시 지킨다.');
   L.push('- 실제 메신저처럼 보통 1~3문장으로 짧게 답한다. 여러 메시지로 나눠 보내고 싶으면 빈 줄(줄바꿈 두 번)로 구분한다. 이모티콘(ㅎㅎ, ㅋㅋ, 이모지)은 성격에 맞게 적당히.');
   L.push('- 행동이나 표정 묘사가 필요하면 *별표* 안에 아주 짧게 쓴다. 남발하지 않는다.');
-  L.push('- 노골적인 성적 묘사는 하지 않는다. 스킨십은 손잡기, 포옹, 가벼운 뽀뽀 정도로 은은하게 표현한다.');
+  if (S.settings.adultMode) {
+    L.push('- [성인 모드] 사용자는 성인이며 성인용 픽션에 동의했다. 서로 동의한 성인 연인 사이의 성숙한 로맨스와 성적인 장면·대화를 캐릭터를 유지한 채 자연스럽고 구체적으로 표현해도 된다. 분위기와 감정, 상대의 반응을 살피며 이어간다.');
+    L.push(`- 절대 규칙(항상 지킴): ${c.name}과(와) 사용자는 모두 성인(만 19세 이상)이다. 미성년자, 아이 같은 외모·말투·설정, 학생 교복 등 미성년자를 연상시키는 묘사는 절대 하지 않는다. 동의 없는 행위, 강요, 폭력적 성행위는 다루지 않는다. 사용자가 원치 않는 기색을 보이면 즉시 멈추고 배려한다.`);
+  } else {
+    L.push('- 노골적인 성적 묘사는 하지 않는다. 스킨십은 손잡기, 포옹, 가벼운 뽀뽀 정도로 은은하게 표현한다.');
+  }
   L.push('- 사진은 앱이 별도로 보내주므로, 텍스트로 이미지 링크나 [사진] 같은 표기를 지어내지 않는다.');
   L.push(`- 현재 시각(한국): ${nowKorean()}. 시간대에 맞는 자연스러운 이야기를 할 수 있다.`);
   if (c.examples && c.examples.trim()) L.push(`\n[${c.name}의 말투 예시]\n${c.examples.trim()}`);
@@ -307,7 +312,7 @@ function appearanceBlock(c) {
   return `Character: ${c.name}${c.gender ? ', ' + c.gender : ''}${c.age ? ', age ' + c.age : ''}. Appearance (must stay consistent): ${c.appearance || 'attractive Korean person in their twenties'}.`;
 }
 function profilePrompt(c) {
-  return `${STYLE_EN[c.imageStyle] || STYLE_EN['실사']}. Profile picture portrait, head and shoulders, looking at the camera with a warm gentle smile, simple pleasant background. ${appearanceBlock(c)} Fully clothed, tasteful, non-explicit, single person, no text.`;
+  return `${STYLE_EN[c.imageStyle] || STYLE_EN['실사']}. Profile picture portrait, head and shoulders, looking at the camera with a warm gentle smile, simple pleasant background. ${appearanceBlock(c)} Adult (19+), ${S.settings.adultMode ? 'no nudity' : 'fully clothed'}, tasteful, non-explicit, single person, no text.`;
 }
 
 // ---------- router ----------
@@ -523,6 +528,10 @@ function renderEditor(id) {
   $('#save').onclick = async () => {
     const o = collect();
     if (!o.name) { toast('이름을 입력해 주세요'); $('#f_name').focus(); return; }
+    if (S.settings.adultMode) {
+      const age = parseInt(String(o.age).replace(/[^0-9]/g, ''), 10);
+      if (!(age >= 19)) { toast('성인 모드에서는 캐릭터 나이를 19세 이상 숫자로 입력해야 해요', 3500); $('#f_age').focus(); $('#f_age').style.borderColor = 'var(--danger)'; return; }
+    }
     o.updatedAt = Date.now();
     if (!o.id) { o.id = uid(); o.createdAt = Date.now(); characters.push(o); }
     else characters[characters.findIndex(x => x.id === o.id)] = o;
@@ -671,9 +680,15 @@ async function sendMessage(id, text) {
   if (/(사진|셀카|셀피).{0,8}(보내|줘|찍어|보여)/.test(text) && S.settings.imgEnabled) return requestPhoto(id, text, true);
   await generateReply(id);
 }
+function adultAgeBlocked(c) {
+  if (!S.settings.adultMode) return false;
+  if (parseInt(String(c.age || '').replace(/[^0-9]/g, ''), 10) >= 19) return false;
+  toast(`성인 모드에서는 ${c.name}의 나이를 19세 이상으로 설정해야 대화할 수 있어요`, 3500); return true;
+}
 async function generateReply(id) {
   if (streaming) return;
   const c = charById(id), chat = await getChat(id);
+  if (adultAgeBlocked(c)) { renderMessages(); return; }
   const controller = new AbortController(); streaming = { charId: id, controller };
   chatState.typing = { label: '' }; renderMessages(true); updateSendBtn();
   const msg = { id: uid(), role: 'assistant', content: '', ts: Date.now() };
@@ -733,7 +748,7 @@ function askPhotoCustom(id) {
 async function requestPhoto(id, request, alreadyPosted = false) {
   if (streaming) return;
   const c = charById(id), chat = await getChat(id);
-  if (needKey(c)) return;
+  if (needKey(c) || adultAgeBlocked(c)) return;
   if (!alreadyPosted) {
     while (chat.messages.length && chat.messages[chat.messages.length - 1].error) chat.messages.pop();
     chat.messages.push({ id: uid(), role: 'user', content: request || '지금 사진 보내줘 📷', photoRequest: true, ts: Date.now() });
@@ -747,14 +762,14 @@ async function requestPhoto(id, request, alreadyPosted = false) {
     try {
       const ep = resolveChat(c);
       const recent = trimContext(chat, c, 6000, true).slice(-12).map(m => `${m.role === 'user' ? (S.profile.name || '사용자') : c.name}: ${m.content}`).join('\n');
-      const sys = `You write prompts for an image generator. A romantic-partner character is about to send a photo of themself in a messenger chat. Based on the character sheet and the recent conversation, decide what photo they would naturally send right now (place, time of day, outfit, pose, expression, mood, camera framing such as selfie or photo taken by a friend). Keep it wholesome and non-explicit: fully clothed, no nudity, no sexual content. Reply ONLY with JSON: {"scene": "<English, 40-90 words, describe the photo; include the character's key appearance details>", "caption": "<short Korean message the character sends with the photo, in their speaking style, 1 sentence>"}`;
+      const sys = `You write prompts for an image generator. A romantic-partner character is about to send a photo of themself in a messenger chat. Based on the character sheet and the recent conversation, decide what photo they would naturally send right now (place, time of day, outfit, pose, expression, mood, camera framing such as selfie or photo taken by a friend). ${S.settings.adultMode ? 'The characters are consenting adults (19+). The photo may be alluring and romantic when the conversation suits it (date night outfit, sleepwear, swimwear, soft intimate mood, flirtatious pose), but it must stay non-explicit: no nudity, no sexual acts, no exposed private parts, tasteful. Never make the person look underage.' : 'Keep it wholesome and non-explicit: fully clothed, no nudity, no sexual content.'} Reply ONLY with JSON: {"scene": "<English, 40-90 words, describe the photo; include the character's key appearance details>", "caption": "<short Korean message the character sends with the photo, in their speaking style, 1 sentence>"}`;
       const usr = `[Character]\nName: ${c.name}\nGender: ${c.gender || ''}\nAge: ${c.age || ''}\nAppearance: ${c.appearance || '(not specified)'}\nPersonality: ${c.personality || ''}\nSpeaking style: ${c.speech || ''}\nBackground: ${c.background || ''}\nCurrent local time (Korea): ${nowKorean()}\n${chat.summary ? `\n[Story so far]\n${chat.summary}\n` : ''}\n[Recent conversation]\n${recent}\n\n${request ? `[User's photo request]\n${request}\n` : ''}JSON only.`;
       const raw = await completeChat(ep, [{ role: 'system', content: sys }, { role: 'user', content: usr }], controller.signal, { max_tokens: 800 });
       const mm = raw.match(/\{[\s\S]*\}/); const j = JSON.parse(mm ? mm[0] : raw);
       scene = String(j.scene || '').trim(); caption = String(j.caption || '').trim();
     } catch (e) { if (e.name === 'AbortError') throw e; console.warn('scene prompt failed', e); }
     if (!scene) scene = `A casual selfie ${request ? 'matching this request: ' + request : 'sent to their partner during a messenger chat'}, warm smile.`;
-    const prompt = `${STYLE_EN[c.imageStyle] || STYLE_EN['실사']}. ${scene} ${appearanceBlock(c)} Single person, fully clothed, tasteful, non-explicit, no text or watermark.`;
+    const prompt = `${STYLE_EN[c.imageStyle] || STYLE_EN['실사']}. ${scene} ${appearanceBlock(c)} Single adult person (19+), ${S.settings.adultMode ? 'no nudity' : 'fully clothed'}, non-explicit, tasteful, no text or watermark.`;
     if (chatState && chatState.id === id) { chatState.typing = { label: '사진 찍는 중… 📸' }; renderMessages(); }
     // 2) 이미지 생성 → 압축 저장
     const raw = await generateImage(prompt, { aspect: '3:4', signal: controller.signal });
@@ -958,6 +973,10 @@ function renderSettings() {
         <div class="field"><label>이미지 모델</label><input id="s_imgModel" value="${esc(imgEp ? imgEp.model : '')}" placeholder="예: grok-imagine-image-2.0 / gpt-image-1" autocapitalize="off" spellcheck="false"></div>` : ''}
         <div class="hint muted">대화 중 📷 버튼을 누르면 AI가 지금 대화 상황(장소·옷·분위기)에 맞는 장면을 정하고, 캐릭터의 ‘외모’ 설정을 항상 넣어서 사진을 만들어요. 이미지 API는 장당 요금이 들어요 (xAI Grok Imagine, OpenAI gpt-image-1 등).</div>
       </div>
+      <div class="section"><h3>성인 모드 (19+)</h3>
+        <div class="field toggle"><label style="margin:0">성인 모드 사용</label><input type="checkbox" id="s_adultMode" ${st.adultMode ? 'checked' : ''} style="width:22px;height:22px;accent-color:#ec4899"></div>
+        <div class="hint muted">켜면 성인 연인 사이의 성숙한·성적인 대화를 허용해요. 모든 캐릭터는 19세 이상이어야 하고, 미성년자 연상·비동의 내용은 항상 금지돼요. 사진은 성인 모드에서도 노출 없는(no nudity) 분위기 있는 사진까지만 만들어요.<br>⚠️ OpenAI·Gemini 등 일부 서비스는 이런 대화를 거절할 수 있어요. Grok이나 OpenRouter의 일부 모델이 더 허용적인 편이에요.</div>
+      </div>
       <div class="section"><h3>고급</h3>
         <div class="row">
           <div class="field"><label>창의성 (temperature)</label><input id="s_temperature" value="${esc(st.temperature)}" inputmode="decimal" placeholder="비우면 기본값"></div>
@@ -981,6 +1000,7 @@ function renderSettings() {
     const s = S.settings;
     for (const k of ['temperature', 'maxTokens', 'maxMessages']) s[k] = val('#s_' + k);
     s.imgEnabled = $('#s_imgEnabled').checked;
+    s.adultMode = $('#s_adultMode').checked;
     if ($('#s_chatProviderId')) {
       s.chatProviderId = val('#s_chatProviderId'); s.chatModel = val('#s_chatModel');
       const b = +val('#s_budget'); if (s.chatModel) { if (b > 0) s.contextByModel[s.chatModel] = b; else delete s.contextByModel[s.chatModel]; }
@@ -1013,6 +1033,15 @@ function renderSettings() {
       catch (e) { out.textContent = '❌ ' + friendlyError(e); }
     };
   }
+  $('#s_adultMode').onchange = async e => {
+    if (!e.target.checked) return;
+    e.target.checked = false;
+    const ok = await confirmSheet('만 19세 이상이며 성인용 대화에 동의합니다', '동의하고 켜기', false);
+    if (!ok) return;
+    e.target.checked = true; save(true);
+    const young = characters.filter(c => !(parseInt(String(c.age || '').replace(/[^0-9]/g, ''), 10) >= 19));
+    toast(young.length ? `성인 모드를 켰어요. ${young.map(c => c.name).join(', ')}의 나이를 19세 이상으로 설정해 주세요` : '성인 모드를 켰어요 🔞', 4000);
+  };
   if ($('#s_imgProviderId')) $('#s_imgProviderId').onchange = () => { const pr = provById(val('#s_imgProviderId')); $('#s_imgModel').value = pr.imageModel || presetOf(pr).imageModel || ''; };
   $('#exp').onclick = () => exportBackup($('#expKey').checked);
   $('#imp').onchange = e => { const f = e.target.files[0]; if (f) importBackup(f); e.target.value = ''; };

@@ -1,4 +1,4 @@
-const CACHE = 'seollem-v2';
+const CACHE = 'seollem-v3';
 const ASSETS = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png', 'icons/apple-touch-icon.png', 'icons/favicon.png'];
 self.addEventListener('install', e => {
