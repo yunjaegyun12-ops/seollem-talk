@@ -67,7 +67,7 @@ const DB = {
 const PRESETS = {
   xai: { label: 'xAI Grok', base: 'https://api.x.ai/v1', model: 'grok-4.7', imageModel: 'grok-imagine-image-2.0', reasoning: 'low', keyPh: 'xai-...' },
   openai: { label: 'OpenAI', base: 'https://api.openai.com/v1', model: 'gpt-4.1-mini', imageModel: 'gpt-image-1', reasoning: '', keyPh: 'sk-...' },
-  gemini: { label: 'Google Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-3.8-flash', imageModel: '', reasoning: 'low', keyPh: 'AIza...' },
+  gemini: { label: 'Google Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-3.8-flash', fallback: 'gemini-3.5-flash-lite', imageModel: '', reasoning: 'low', keyPh: 'AIza...' },
   openrouter: { label: 'OpenRouter', base: 'https://openrouter.ai/api/v1', model: 'x-ai/grok-4.7', imageModel: '', reasoning: '', keyPh: 'sk-or-...' },
   custom: { label: '직접 입력 (OpenAI 호환)', base: '', model: '', imageModel: '', reasoning: '', keyPh: '' },
 };
@@ -228,9 +228,29 @@ async function fetchModels(base, key) {
 }
 async function apiError(res) {
   let t = ''; try { t = await res.text(); } catch {}
-  let msg = t; try { const j = JSON.parse(t); msg = j.error?.message || j.error || j.message || t; if (typeof msg !== 'string') msg = JSON.stringify(msg); } catch {}
-  const hint = res.status === 401 ? ' (API 키를 확인해 주세요)' : res.status === 404 ? ' (모델 이름이나 주소를 확인해 주세요)' : res.status === 429 ? ' (요청 한도 초과 또는 크레딧 부족)' : '';
-  const e = new Error(`API 오류 ${res.status}${hint}: ${String(msg).slice(0, 300)}`); e.status = res.status; e.body = t; return e;
+  let msg = t, retryAfter = 0;
+  try {
+    let j = JSON.parse(t); if (Array.isArray(j)) j = j[0] || {};
+    const er = j.error || j;
+    msg = (typeof er === 'string' ? er : er.message) || j.message || t;
+    if (er.status) msg = `${er.status}: ${msg}`;
+    const ri = (er.details || []).find(d => d.retryDelay); if (ri) retryAfter = parseFloat(ri.retryDelay) || 0;
+  } catch {}
+  const ra = res.headers && res.headers.get('retry-after');
+  if (ra) retryAfter = isNaN(+ra) ? Math.max(0, (Date.parse(ra) - Date.now()) / 1000) : +ra;
+  const e = new Error(`API 오류 ${res.status}: ${String(msg).slice(0, 300)}`);
+  e.status = res.status; e.body = t; e.retryAfter = retryAfter; e.raw = `HTTP ${res.status}\n${t.slice(0, 2000)}`;
+  return e;
+}
+const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+const RETRY_DELAYS = [1000, 3000, 7000];
+const isQuotaExhausted = e => e.status === 429 && /quota|exceeded|RESOURCE_EXHAUSTED|free.?tier|credit|insufficient|billing|per.?day/i.test(e.body || '');
+function abortableSleep(ms, signal) {
+  return new Promise((res, rej) => {
+    if (signal && signal.aborted) return rej(new DOMException('aborted', 'AbortError'));
+    const t = setTimeout(res, ms);
+    signal && signal.addEventListener('abort', () => { clearTimeout(t); rej(new DOMException('aborted', 'AbortError')); }, { once: true });
+  });
 }
 function chatBody(ep, messages, stream, extra = {}) {
   const st = ep.st || S.settings;
@@ -240,7 +260,35 @@ function chatBody(ep, messages, stream, extra = {}) {
   if (ep.reasoning) b.reasoning_effort = ep.reasoning;
   return Object.assign(b, extra);
 }
-async function postChat(ep, body, signal) {
+// 혼잡(429/5xx) 시 지수 백오프로 재시도 → 그래도 안 되면 연결의 '대신 쓸 모델'로 한 번 더
+function fallbackOf(ep) {
+  const p = ep.p || {}; const f = (p.fallbackModel !== undefined ? p.fallbackModel : presetOf(p).fallback || '') || '';
+  return f.trim() && f.trim() !== ep.model ? f.trim() : '';
+}
+async function postChat(ep, body, signal, opts = {}) {
+  let lastErr;
+  const tries = opts.noRetry ? 0 : RETRY_DELAYS.length;
+  for (let attempt = 0; attempt <= tries; attempt++) {
+    try { return await postChatOnce(ep, body, signal); }
+    catch (e) {
+      lastErr = e;
+      if (e.name === 'AbortError' || !RETRYABLE.has(e.status) || isQuotaExhausted(e) || attempt === tries) break;
+      let wait = RETRY_DELAYS[attempt];
+      if (e.retryAfter) { if (e.retryAfter > 20) break; wait = Math.max(wait, e.retryAfter * 1000); }
+      opts.onRetry && opts.onRetry(attempt + 1, tries);
+      await abortableSleep(wait, signal);
+    }
+  }
+  const fb = !opts.noFallback && lastErr && lastErr.name !== 'AbortError' && RETRYABLE.has(lastErr.status) ? fallbackOf(ep) : '';
+  if (fb) {
+    opts.onFallback && opts.onFallback(fb);
+    const res = await postChat({ ...ep, model: fb }, { ...body, model: fb }, signal, { ...opts, noFallback: true, onRetry: opts.onRetry });
+    if (opts.info) opts.info.fallback = fb;
+    return res;
+  }
+  throw lastErr;
+}
+async function postChatOnce(ep, body, signal) {
   const url = ep.base + '/chat/completions';
   let res = await fetch(url, { method: 'POST', headers: headers(ep.key, ep.base), body: JSON.stringify(body), signal });
   if (res.status === 400 || res.status === 422) {
@@ -255,13 +303,17 @@ async function postChat(ep, body, signal) {
   if (!res.ok) throw await apiError(res);
   return res;
 }
-async function streamChat(ep, messages, onDelta, signal) {
-  const res = await postChat(ep, chatBody(ep, messages, true), signal);
+function safetyError(reason) { const e = new Error('safety blocked: ' + reason); e.safety = true; e.raw = 'finish_reason: ' + reason; return e; }
+const SAFETY_REASONS = /content_filter|safety|blocked|prohibited|recitation|spii/i;
+async function streamChat(ep, messages, onDelta, signal, opts = {}) {
+  const res = await postChat(ep, chatBody(ep, messages, true), signal, opts);
   const ct = res.headers.get('content-type') || '';
   if (!res.body || ct.includes('application/json')) {
-    const j = await res.json(); const t = j.choices?.[0]?.message?.content || ''; onDelta(t); return t;
+    const j = await res.json(); const t = j.choices?.[0]?.message?.content || '';
+    if (!t && SAFETY_REASONS.test(j.choices?.[0]?.finish_reason || '')) throw safetyError(j.choices[0].finish_reason);
+    onDelta(t); return t;
   }
-  const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '', full = '';
+  const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '', full = '', finish = '';
   for (;;) {
     const { value, done } = await reader.read(); if (done) break;
     buf += dec.decode(value, { stream: true });
@@ -269,17 +321,19 @@ async function streamChat(ep, messages, onDelta, signal) {
     while ((i = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
       if (!line.startsWith('data:')) continue;
-      const data = line.slice(5).trim(); if (data === '[DONE]') return full;
+      const data = line.slice(5).trim(); if (data === '[DONE]') { buf = ''; break; }
       let j; try { j = JSON.parse(data); } catch { continue; }
-      if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+      if (j.error) { const e = new Error(j.error.message || JSON.stringify(j.error)); e.status = j.error.code; e.body = data; e.raw = data.slice(0, 2000); throw e; }
+      if (j.choices?.[0]?.finish_reason) finish = j.choices[0].finish_reason;
       const d = j.choices?.[0]?.delta?.content || '';
       if (d) { full += d; onDelta(d); }
     }
   }
+  if (!full.trim() && SAFETY_REASONS.test(finish)) throw safetyError(finish);
   return full;
 }
-async function completeChat(ep, messages, signal, extra) {
-  const res = await postChat(ep, chatBody(ep, messages, false, extra), signal);
+async function completeChat(ep, messages, signal, extra, opts) {
+  const res = await postChat(ep, chatBody(ep, messages, false, extra), signal, opts);
   const j = await res.json(); return j.choices?.[0]?.message?.content || '';
 }
 async function generateImage(prompt, { aspect = '3:4', signal } = {}) {
@@ -657,9 +711,10 @@ async function renderMessages(forceBottom) {
     const me = m.role === 'user';
     let parts;
     if (m.type === 'image') parts = [`<div class="bubble photo"><img src="${esc(m.image)}" alt="사진" data-view="1" loading="lazy">${m.note ? `<div class="pnote">ⓘ ${esc(m.note)}</div>` : ''}</div>`].concat(m.caption ? [`<div class="bubble">${richText(m.caption)}</div>`] : []);
-    else if (m.error) parts = [`<div class="bubble err">⚠️ ${esc(m.content)}</div>`];
+    else if (m.error) parts = [`<div class="bubble err">⚠️ ${esc(m.content)}${m.raw ? `<details class="raw"><summary>자세히</summary><pre>${esc(m.raw)}</pre></details>` : ''}</div>`];
     else parts = (me ? [m.content] : splitBubbles(m.content)).map(p => `<div class="bubble">${me ? esc(p) : richText(p)}</div>`);
     if (!parts.length) parts = ['<div class="bubble">…</div>'];
+    if (m.note && m.type !== 'image' && !m.error) parts.push(`<div class="mnote">ⓘ ${esc(m.note)}</div>`);
     const lines = parts.map((p, k) => `<div class="bline">${p}${k === parts.length - 1 && showTime ? `<span class="mtime">${fmtTime(m.ts)}</span>` : ''}</div>`).join('');
     html += `<div class="mrow ${me ? 'me' : 'ai'}" data-mid="${m.id}" style="${sameMinutePrev ? '' : 'margin-top:10px'}">
       ${me ? '' : (sameMinutePrev ? '<div class="spacer"></div>' : `<img class="avatar" src="${esc(avatarOf(c))}" alt="">`)}
@@ -739,17 +794,20 @@ async function generateReply(id) {
     await sleep(350);
     const ep = resolveChat(c);
     const messages = [{ role: 'system', content: buildSystemPrompt(c, chat) }, ...trimContext(chat, c, contextBudget(ep.model))];
-    let pending = false;
+    let pending = false; const info = {};
+    const setLabel = label => { if (chatState && chatState.id === id && chatState.typing) { chatState.typing = { label }; renderMessages(); } };
+    const sopts = { info, onRetry: (n, t) => setLabel(`잠시 혼잡해서 다시 시도 중… (${n}/${t})`), onFallback: m => setLabel(`혼잡해서 ${m} 모델로 바꿔서 답장 중…`) };
     await streamChat(ep, messages, d => {
       msg.content += d;
       if (!added) { added = true; chat.messages.push(msg); if (chatState && chatState.id === id) chatState.typing = null; }
       if (!pending && current.view === 'chat' && current.id === id) { pending = true; requestAnimationFrame(() => { pending = false; renderMessages(); }); }
-    }, controller.signal);
+    }, controller.signal, sopts);
     if (!msg.content.trim()) { if (added) chat.messages.pop(); throw new Error('빈 응답이 왔어요. 다시 시도해 주세요.'); }
     msg.content = msg.content.trim(); msg.ts = Date.now(); ok = true;
+    if (info.fallback) msg.note = `기본 모델이 혼잡해서 ${info.fallback} 모델로 답했어요`;
   } catch (e) {
     if (e.name === 'AbortError') { if (added && !msg.content.trim()) chat.messages.pop(); }
-    else { if (added && !msg.content.trim()) chat.messages.pop(); chat.messages.push({ id: uid(), role: 'assistant', error: true, content: friendlyError(e), ts: Date.now() }); }
+    else { if (added && !msg.content.trim()) chat.messages.pop(); chat.messages.push({ id: uid(), role: 'assistant', error: true, content: friendlyError(e, resolveChat(c)), raw: errorRaw(e), ts: Date.now() }); }
   } finally {
     streaming = null; if (chatState && chatState.id === id) chatState.typing = null;
     await saveChat(id);
@@ -757,10 +815,33 @@ async function generateReply(id) {
   }
   if (ok) runMemory(id);
 }
-function friendlyError(e) {
-  if (e instanceof TypeError && /fetch|network|Load failed/i.test(e.message)) return '서버에 연결하지 못했어요. 인터넷 연결이나 API 주소를 확인해 주세요. (브라우저에서 직접 호출을 막는 서비스일 수도 있어요)';
+function friendlyError(e, ep) {
+  if (!e) return '알 수 없는 오류가 났어요.';
+  const body = (e.body || '') + ' ' + (e.message || '');
+  const model = ep && ep.model ? ` (현재 모델: ${ep.model})` : '';
+  if (e.safety || /SAFETY|content.?filter|blocked|PROHIBITED_CONTENT|moderation|policy violation|safety system/i.test(body))
+    return '이 내용은 AI 서비스의 안전 정책에 걸려 답장이 차단됐어요. 표현을 조금 바꾸거나, 더 허용적인 모델(예: Grok)로 바꿔 보세요.';
+  if (e instanceof TypeError && /fetch|network|Load failed/i.test(e.message))
+    return '서버에 연결하지 못했어요. 인터넷 연결을 확인해 주세요. (API 주소가 틀렸거나 브라우저 직접 호출을 막는 서비스일 수도 있어요)';
+  switch (true) {
+    case e.status === 503 || /overloaded|high demand|UNAVAILABLE/i.test(body):
+      return `지금 AI 서버가 너무 붐벼서 답장을 못 했어요${model}. 몇 번 다시 시도했지만 안 됐어요. 잠시 후 ‘다시 시도’를 누르거나, 대화방 ⋮ → ‘AI 모델 바꾸기’에서 가벼운 모델로 바꿔 보세요.`;
+    case isQuotaExhausted(e):
+      return '사용 한도를 다 썼어요 (무료 등급 한도 또는 크레딧 부족). 잠시 뒤(일일 한도라면 내일) 다시 하거나, 다른 모델·연결로 바꿔 보세요.';
+    case e.status === 429:
+      return '요청이 너무 잦아서 잠깐 막혔어요. 1분쯤 쉬었다가 다시 보내 주세요.';
+    case e.status === 401 || e.status === 403:
+      return 'API 키가 올바르지 않거나 이 키로는 권한이 없어요. 설정 > AI 연결에서 키를 다시 확인해 주세요.';
+    case (e.status === 400 || e.status === 404) && /model|not found|NOT_FOUND|does not exist|unknown/i.test(body):
+      return `모델 이름이 잘못됐거나 이 키로 쓸 수 없는 모델이에요${model}. 설정에서 ‘모델 목록 불러오기’로 정확한 이름을 골라 주세요.`;
+    case e.status === 400:
+      return '요청 형식이 맞지 않아 거절됐어요. 설정의 모델·추론 강도를 바꿔 보거나 ‘자세히’를 확인해 주세요.';
+    case e.status >= 500:
+      return 'AI 서버에서 오류가 났어요. 잠시 후 다시 시도해 주세요.';
+  }
   return e.message || String(e);
 }
+function errorRaw(e) { return e ? (e.raw || e.body || e.message || String(e)).slice(0, 2000) : ''; }
 async function regenerate(id) {
   if (streaming) return;
   const chat = await getChat(id); const last = chat.messages[chat.messages.length - 1];
@@ -829,7 +910,7 @@ async function requestPhoto(id, request, alreadyPosted = false) {
     let image = raw; try { image = await compressImage(raw, { max: 768, quality: 0.82 }); } catch {}
     chat.messages.push({ id: uid(), role: 'assistant', type: 'image', image, caption: caption || '', prompt, request: request || '', usedRef, note, ts: Date.now() });
   } catch (e) {
-    if (e.name !== 'AbortError') chat.messages.push({ id: uid(), role: 'assistant', error: true, content: '사진을 만들지 못했어요: ' + friendlyError(e), ts: Date.now() });
+    if (e.name !== 'AbortError') chat.messages.push({ id: uid(), role: 'assistant', error: true, content: '사진을 만들지 못했어요. ' + friendlyError(e), raw: errorRaw(e), ts: Date.now() });
   } finally {
     streaming = null; if (chatState && chatState.id === id) chatState.typing = null;
     try { await saveChat(id); } catch (e) { toast('저장 공간이 부족해요. 오래된 사진을 지워 주세요.'); }
@@ -1111,7 +1192,7 @@ function providerSheet(pid) {
   const hints = {
     xai: 'console.x.ai 에서 키 발급 · 선불 크레딧 충전 필요. 채팅 grok-4.7, 사진 grok-imagine-image-2.0',
     openai: 'platform.openai.com 에서 키 발급 (유료). 사진은 gpt-image-1',
-    gemini: 'aistudio.google.com 에서 무료 키 발급. 무료 등급으로 채팅 가능 (gemini-3.8-flash 등). 사진 모델은 유료',
+    gemini: 'aistudio.google.com 에서 무료 키 발급. 무료 등급으로 채팅 가능 (gemini-3.8-flash, 더 가벼운 gemini-3.5-flash-lite 등). 붐빌 때 503이 날 수 있어 대신 쓸 모델을 넣어 두면 좋아요. 사진 모델은 유료',
     openrouter: 'openrouter.ai 에서 키 발급. 모델 이름이 :free 로 끝나는 무료 모델은 요금 없이 쓸 수 있어요 (일일 횟수 제한)',
     custom: 'OpenAI 호환 /chat/completions 를 지원하는 주소 (끝은 보통 /v1)',
   };
@@ -1128,6 +1209,8 @@ function providerSheet(pid) {
         <div class="field"><label>추론 강도</label><select id="pv_reasoningEffort">${['', 'low', 'medium', 'high'].map(v => `<option value="${v}" ${(x.reasoningEffort || '') === v ? 'selected' : ''}>${v || '보내지 않음'}</option>`).join('')}</select></div>
       </div>
       <div class="hint muted" style="margin:-4px 0 12px">추론 강도 low는 답장을 빠르고 저렴하게 해 줘요 (지원하는 모델만).</div>
+      <div class="field"><label>혼잡할 때 대신 쓸 모델 (선택)</label><input id="pv_fallbackModel" value="${esc(x.fallbackModel !== undefined ? x.fallbackModel : (presetOf(x).fallback || ''))}" placeholder="예: gemini-3.5-flash-lite" list="pvModels" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <div class="hint">기본 모델이 503/429 등으로 몇 번 실패하면 이 모델로 한 번 더 답장해요.</div></div>
       <div class="field"><label>참고 이미지 지원 (프로필 사진 기준 사진 생성)</label><select id="pv_refMode">${[['auto', '자동 (xAI·OpenAI gpt-image·OpenRouter 지원)'], ['on', '지원함'], ['off', '사용 안 함']].map(([v, l]) => `<option value="${v}" ${(x.refMode || 'auto') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
         <div class="hint">지원하지 않거나 실패하면 외모 설명만으로 만들어요. Gemini 호환 주소는 미지원이에요.</div></div>
       <div class="row">${pid ? '<button class="btn danger" id="pvDel" type="button">삭제</button>' : ''}<button class="btn primary" id="pvSave" type="button">저장</button></div>
@@ -1136,7 +1219,7 @@ function providerSheet(pid) {
     hint();
     $('#pv_preset', el).onchange = () => {
       const pr = PRESETS[$('#pv_preset', el).value];
-      $('#pv_baseUrl', el).value = pr.base; $('#pv_model', el).value = pr.model; $('#pv_imageModel', el).value = pr.imageModel; $('#pv_reasoningEffort', el).value = pr.reasoning;
+      $('#pv_baseUrl', el).value = pr.base; $('#pv_model', el).value = pr.model; $('#pv_imageModel', el).value = pr.imageModel; $('#pv_reasoningEffort', el).value = pr.reasoning; $('#pv_fallbackModel', el).value = pr.fallback || '';
       $('#pv_apiKey', el).placeholder = pr.keyPh || 'API 키'; hint();
     };
     $('#pvLoad', el).onclick = async () => {
@@ -1149,7 +1232,7 @@ function providerSheet(pid) {
     };
     $('#pvSave', el).onclick = () => {
       const o = { ...x };
-      for (const k of ['preset', 'name', 'baseUrl', 'apiKey', 'model', 'imageModel', 'reasoningEffort', 'refMode']) o[k] = $('#pv_' + k, el).value.trim();
+      for (const k of ['preset', 'name', 'baseUrl', 'apiKey', 'model', 'imageModel', 'reasoningEffort', 'refMode', 'fallbackModel']) o[k] = $('#pv_' + k, el).value.trim();
       if (!o.baseUrl) { toast('API 주소를 입력해 주세요'); return; }
       if (!o.name) o.name = PRESETS[o.preset].label;
       const st = S.settings;
